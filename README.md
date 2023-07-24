@@ -14,4 +14,6 @@ Unlike tint2, this is neither a taskbar nor a launcher. If configured properly, 
 
 The panel is not configurable in the usual sense. If it does not fit a particular system, it should be modified or re-written completely.
 
-The design was originally (~2008, maybe earlier) based on IceWM taskbar.
+There is now a very limited systray area support, mostly for Wine because its floating tray is very annoying.
+
+The design was originally (~2008, maybe earlier) based on the IceWM taskbar.

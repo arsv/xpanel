@@ -11,16 +11,14 @@
 #include <xcb/xcb_image.h>
 
 #include "common.h"
-
-#define W 500
-#define H 20
+#include "panel.h"
 
 uint timer_fd;
 uint xconn_fd;
 
 xcb_connection_t* conn;
 xcb_screen_t* screen;
-xcb_window_t win;
+xcb_window_t panwin;
 xcb_gcontext_t gc;
 xcb_pixmap_t pix;
 
@@ -68,16 +66,17 @@ static void init_connection(void)
 static void create_window(void)
 {
 	uint mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
-	uint values[2] = { screen->black_pixel, XCB_EVENT_MASK_EXPOSURE };
+	uint evmask = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+	uint values[2] = { screen->black_pixel, evmask };
 	/* xcb-util-wm, but I'm not bringing a whole library in just for this */
 	uint wmhints[9] = { (1<<1), 0, 0, 0, 0, 0, 0, 0, 0 };
 
-	win = xcb_generate_id(conn);
+	panwin = xcb_generate_id(conn);
 	gc = xcb_generate_id(conn);
 
 	xcb_create_window(conn,
 	                  screen->root_depth,
-	                  win,
+	                  panwin,
 	                  screen->root,
 	                  0, 0, H, H, 0,
 	                  XCB_WINDOW_CLASS_INPUT_OUTPUT,
@@ -86,17 +85,17 @@ static void create_window(void)
 
 	/* one of these calls should be enough, but let's do both */
 
-	xcb_change_property(conn, XCB_PROP_MODE_REPLACE, win,
+	xcb_change_property(conn, XCB_PROP_MODE_REPLACE, panwin,
 			XCB_ATOM_WM_HINTS, XCB_ATOM_WM_HINTS, 32,
 			 sizeof(wmhints) >> 2, &wmhints);
 
-	xcb_change_property(conn, XCB_PROP_MODE_REPLACE, win,
+	xcb_change_property(conn, XCB_PROP_MODE_REPLACE, panwin,
 			XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8,
 			15, "dockapp\0DockApp");
 
-	xcb_create_gc(conn, gc, win, 0, NULL);
+	xcb_create_gc(conn, gc, panwin, 0, NULL);
 
-	xcb_map_window(conn, win);
+	xcb_map_window(conn, panwin);
 
 	xcb_flush(conn);
 
@@ -125,7 +124,7 @@ static void init_image_buf(void)
 
 	pix = xcb_generate_id(conn);
 
-	xcb_shm_create_pixmap(conn, pix, win, W, H,
+	xcb_shm_create_pixmap(conn, pix, panwin, W, H,
 			screen->root_depth, info.shmseg, 0);
 
 	shmctl(info.shmid, IPC_RMID, 0);
@@ -139,39 +138,45 @@ static void repaint_window(void)
 {
 	if(!pix_wused) return;
 
-	uint w = win_width;
-	uint h = win_height;
+	uint w = pix_wused;
+	uint h = pix_height;
 
-	xcb_copy_area(conn, pix, win, gc, 0, 0, 0, 0, w, h);
+	uint x = total_icons;
+	uint y = 0;
 
-	xcb_flush(conn);
+	xcb_copy_area(conn, pix, panwin, gc, 0, 0, x, y, w, h);
 }
 
-static void resize_window(uint width)
+static void resize_window(int width)
 {
 	uint value_mask = XCB_CONFIG_WINDOW_WIDTH;
 	uint value_list[] = { width };
 
-	xcb_configure_window(conn, win, value_mask, value_list);
+	xcb_configure_window(conn, panwin, value_mask, value_list);
 
 	if(!win_width)
-		xcb_map_window(conn, win);
+		xcb_map_window(conn, panwin);
 
 	win_width = width;
 }
 
-static void redraw_window(void)
+void redraw_window(void)
 {
-	if(pix_wused == win_width) {
-		repaint_window();
-	} else if(pix_wused) {
-		resize_window(pix_wused);
-		repaint_window();
-	} else {
-		win_width = 0;
-		xcb_unmap_window(conn, win);
-		xcb_flush(conn);
-	}
+	int need = total_icons + pix_wused;
+
+	if(need != win_width)
+		resize_window(need);
+
+	repaint_window();
+}
+
+static void report_error_event(xcb_generic_error_t* evt)
+{
+	warnx("X error 0x%08X %i.%i code %i\n",
+			evt->resource_id,
+			evt->major_code,
+			evt->minor_code,
+			evt->error_code);
 }
 
 static void check_xconn(void)
@@ -179,10 +184,19 @@ static void check_xconn(void)
 	xcb_generic_event_t* evt;
 
 	while((evt = xcb_poll_for_event(conn))) {
-		uint type = evt->response_type;
+		uint type = evt->response_type & 0x7F;
+		void* evp = (void*)evt;
 
+		if(type == 0)
+			report_error_event(evp);
 		if(type == XCB_EXPOSE)
 			repaint_window();
+		if(type == XCB_CLIENT_MESSAGE)
+			handle_client_message(evp);
+		if(type == XCB_REPARENT_NOTIFY)
+			handle_reparent_notify(evp);
+		if(type == XCB_DESTROY_NOTIFY)
+			handle_destroy_notify(evp);
 	}
 }
 
@@ -272,6 +286,8 @@ static void poll_fds(void)
 		check_xconn();
 	if(pfds[1].revents & ~POLLIN)
 		errx(-1, "lost xconnfd");
+
+	xcb_flush(conn);
 }
 
 int main(void)
@@ -279,8 +295,9 @@ int main(void)
 	init_connection();
 	create_window();
 	init_image_buf();
-	init_mailbox();
+	init_systray();
 
+	init_mailbox();
 	open_timer_fd();
 
 	update_image();
